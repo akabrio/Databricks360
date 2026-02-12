@@ -1,7 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-resourcegroupname="$1"
+rgname="$1"
 tenantid="$2"
 clientid="$3"
 clientsecret="$4"
@@ -9,19 +9,24 @@ repourl="$5"
 ghuser="$6"
 ghpat="$7"
 
-echo "rgname      : $resourcegroupname"
-echo "tenant      : $tenantid"
-echo "client id   : $clientid"
-echo "repourl     : $repourl"
-echo "ghuser      : $ghuser"
-# DO NOT echo secrets
+# (Optional) protect against CRLF if this file ever gets checked out wrong
+# NOTE: this line only works if you run it from another script before this one.
+# sed -i 's/\r$//' "$0"
 
-# --- Get first workspace in RG (better: filter by workspace name if you can) ---
-# Output: workspaceUrl<TAB>id
-workspacestuff="$(az databricks workspace list -g "$resourcegroupname" --query "[0].{url:workspaceUrl, id:id}" -o tsv)"
+echo "rgname: $rgname"
+echo "tenant: $tenantid"
+echo "client id: ****"
+echo "repourl: $repourl"
+echo "ghuser: $ghuser"
 
-if [ -z "$workspacestuff" ]; then
-  echo "No Databricks workspace found in resource group: $resourcegroupname"
+# Ensure databricks cli is available (depends on how you installed it)
+export PATH="$HOME/.local/bin:$PATH"
+databricks version || true
+
+# Get workspace URL + ARM resource ID (first workspace in RG)
+workspacestuff="$(az databricks workspace list -g "$rgname" --query "[0].{url:workspaceUrl,id:id}" -o tsv)"
+if [[ -z "$workspacestuff" ]]; then
+  echo "No Databricks workspace found in RG: $rgname"
   exit 1
 fi
 
@@ -31,44 +36,35 @@ workspaceArmId="$(echo "$workspacestuff" | awk '{print $2}')"
 echo "workspaceUrl: $workspaceUrl"
 echo "workspaceArmId: $workspaceArmId"
 
-# --- Auth for Databricks CLI via Azure (OIDC/SP already logged in by AzureCLI task) ---
-export ARM_CLIENT_ID="$clientid"
-export ARM_CLIENT_SECRET="$clientsecret"
-export ARM_TENANT_ID="$tenantid"
-export DATABRICKS_AZURE_RESOURCE_ID="$workspaceArmId"
-
-# Optional but useful for some CLI flows:
+# Unified Auth env vars
 export DATABRICKS_HOST="https://${workspaceUrl}"
+export DATABRICKS_AZURE_RESOURCE_ID="${workspaceArmId}"
+export ARM_CLIENT_ID="${clientid}"
+export ARM_CLIENT_SECRET="${clientsecret}"
+export ARM_TENANT_ID="${tenantid}"
 
-# --- Ensure git credentials exist ---
-creds="$(databricks git-credentials list --output json || true)"
+# Debug (non-secret) - shows what auth method it will use
+databricks auth env --output json || true
 
-if [ -z "$creds" ] || [ "$creds" = "[]" ]; then
-  echo "No git credentials found; creating..."
+# Git credentials
+creds="$(databricks git-credentials list --output json)"
+if [[ "$creds" == "[]" ]]; then
+  echo "No git credentials found. Creating…"
   databricks git-credentials create --json "{
     \"personal_access_token\": \"${ghpat}\",
     \"git_username\": \"${ghuser}\",
     \"git_provider\": \"gitHub\"
   }"
 else
-  echo "Git credentials already exist; skipping create."
+  echo "Git credentials exist. Skipping create."
 fi
 
-# --- Create repo in workspace ---
-# Choose a deterministic workspace path
+# Repo create
 repoName="$(basename "$repourl")"
 repoName="${repoName%.git}"
 workspaceRepoPath="/Repos/${ghuser}/${repoName}"
 
-echo "Creating repo at workspace path: $workspaceRepoPath"
-
-# NOTE: CLI syntax varies by version; this is the common pattern for modern databricks CLI.
-# If your CLI complains, I’ll adapt to the exact version string from `databricks --version`.
-databricks repos create --url "$repourl" --provider gitHub --path "$workspaceRepoPath" || {
-  echo "Repo create failed. If it already exists, you may want to update instead."
-  echo "Trying to list existing repos..."
-  databricks repos list --output json || true
-  exit 1
-}
+echo "Creating repo at: $workspaceRepoPath"
+databricks repos create --url "$repourl" --provider gitHub --path "$workspaceRepoPath"
 
 echo "finished"
