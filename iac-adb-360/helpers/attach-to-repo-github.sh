@@ -9,23 +9,19 @@ repourl="$5"
 ghuser="$6"
 ghpat="$7"
 
-# (Optional) protect against CRLF if this file ever gets checked out wrong
-# NOTE: this line only works if you run it from another script before this one.
-# sed -i 's/\r$//' "$0"
-
 echo "rgname: $rgname"
 echo "tenant: $tenantid"
 echo "client id: ****"
 echo "repourl: $repourl"
 echo "ghuser: $ghuser"
 
-# Ensure databricks cli is available (depends on how you installed it)
+# Ensure databricks CLI is available (depends on how you installed it)
 export PATH="$HOME/.local/bin:$PATH"
-databricks version || true
+databricks version
 
 # Get workspace URL + ARM resource ID (first workspace in RG)
-workspacestuff="$(az databricks workspace list -g "$rgname" --query "[0].{url:workspaceUrl,id:id}" -o tsv)"
-if [[ -z "$workspacestuff" ]]; then
+workspacestuff="$(az databricks workspace list -g "$rgname" --query "[0].[workspaceUrl,id]" -o tsv)"
+if [[ -z "${workspacestuff:-}" ]]; then
   echo "No Databricks workspace found in RG: $rgname"
   exit 1
 fi
@@ -43,28 +39,39 @@ export ARM_CLIENT_ID="${clientid}"
 export ARM_CLIENT_SECRET="${clientsecret}"
 export ARM_TENANT_ID="${tenantid}"
 
-# Debug (non-secret) - shows what auth method it will use
+# Debug (non-secret)
 databricks auth env --output json || true
 
-# Git credentials
+# Git credentials (avoid JSON escaping issues by using a temp file)
 creds="$(databricks git-credentials list --output json)"
 if [[ "$creds" == "[]" ]]; then
   echo "No git credentials found. Creating…"
-  databricks git-credentials create --json "{
-    \"personal_access_token\": \"${ghpat}\",
-    \"git_username\": \"${ghuser}\",
-    \"git_provider\": \"gitHub\"
-  }"
+  tmpjson="$(mktemp)"
+  cat > "$tmpjson" <<EOF
+{
+  "personal_access_token": "${ghpat}",
+  "git_username": "${ghuser}",
+  "git_provider": "gitHub"
+}
+EOF
+  databricks git-credentials create --json @"$tmpjson"
+  rm -f "$tmpjson"
 else
   echo "Git credentials exist. Skipping create."
 fi
 
-# Repo create
+# Repo create (skip if already exists)
 repoName="$(basename "$repourl")"
 repoName="${repoName%.git}"
 workspaceRepoPath="/Repos/${ghuser}/${repoName}"
 
-echo "Creating repo at: $workspaceRepoPath"
-databricks repos create --url "$repourl" --provider gitHub --path "$workspaceRepoPath"
+echo "Ensuring repo at: $workspaceRepoPath"
+if databricks repos create --url "$repourl" --provider gitHub --path "$workspaceRepoPath" 2>/dev/null; then
+  echo "Repo created."
+else
+  echo "Repo may already exist. Listing to verify..."
+  databricks repos list --output json | head -c 2000 || true
+  echo "Continuing."
+fi
 
 echo "finished"
